@@ -59,15 +59,19 @@ fun FloatingBottomNavBar(
 ) {
     val shortsIcon = ImageVector.vectorResource(id = R.drawable.ic_shorts)
 
-    val enabledItems = remember(isShortsEnabled, isMusicEnabled, isSearchEnabled, isCategoriesEnabled, navOrder) {
+    val enabledItems = remember(navOrder) {
         val items = buildList {
-            add(NavItemSpec(0, Icons.Filled.Home,          Icons.Outlined.Home,          R.string.nav_home))
-            if (isShortsEnabled)    add(NavItemSpec(1, shortsIcon,                shortsIcon,                   R.string.nav_shorts))
-            if (isMusicEnabled)     add(NavItemSpec(2, Icons.Filled.MusicNote,   Icons.Outlined.MusicNote,     R.string.nav_music))
-            add(NavItemSpec(3, Icons.Filled.Subscriptions, Icons.Outlined.Subscriptions, R.string.nav_subs))
-            add(NavItemSpec(4, Icons.Filled.VideoLibrary,  Icons.Outlined.VideoLibrary,  R.string.nav_library))
-            if (isSearchEnabled)    add(NavItemSpec(5, Icons.Filled.Search,      Icons.Outlined.Search,        R.string.nav_search))
-            if (isCategoriesEnabled)add(NavItemSpec(6, Icons.Filled.Explore,     Icons.Outlined.Explore,       R.string.nav_explore))
+            // Index 0 -> Discover (Temporarily routing to "music" in FlowApp.kt)
+            add(NavItemSpec(0, Icons.Filled.Home, Icons.Outlined.Home, R.string.nav_home)) 
+            
+            // Index 1 -> Search
+            add(NavItemSpec(1, Icons.Filled.Search, Icons.Outlined.Search, R.string.nav_search))
+            
+            // Index 2 -> Library
+            add(NavItemSpec(2, Icons.Filled.VideoLibrary, Icons.Outlined.VideoLibrary, R.string.nav_library))
+            
+            // Index 3 -> Personality / FlowNeuro Dashboard
+            add(NavItemSpec(3, Icons.Filled.Person, Icons.Outlined.Person, R.string.nav_explore)) // Reusing explore/person string for now
         }
         val order = navOrder.withIndex().associate { it.value to it.index }
         items.sortedBy { order[it.index] ?: Int.MAX_VALUE }

@@ -434,11 +434,11 @@ fun FlowApp(
         ) {
             FloatingBottomNavBar(
                 selectedIndex = selectedBottomNavIndex.intValue,
-                isShortsEnabled = isShortsNavigationEnabled,
-                isMusicEnabled = isMusicNavigationEnabled,
-                isSearchEnabled = isSearchNavigationEnabled,
-                isCategoriesEnabled = isCategoriesNavigationEnabled,
-                navOrder = navTabOrder,
+                isShortsEnabled = false,
+                isMusicEnabled = false, // Set to false because we are redefining the tabs entirely
+                isSearchEnabled = true,
+                isCategoriesEnabled = false,
+                navOrder = listOf(0, 1, 2, 3), // Only 4 tabs now
                 onItemSelected = { index ->
                     val route = navRouteForIndex(index)
 
@@ -566,21 +566,19 @@ fun FlowApp(
     )
 
     DonationPromptHost(
-        enabled = needsOnboarding == false && !isInPipMode && !playerVisible,
+        enabled = needsOnboarding == false && !isInPipMode,
         onNavigateToDonations = { navController.navigate("donations") }
     )
   }
 }
 
+// TEMPORARY FIX until Discover screen is built
 private fun navRouteForIndex(index: Int): String = when (index) {
-    0 -> "home"
-    1 -> "shorts"
-    2 -> "music"
-    3 -> "subscriptions"
-    4 -> "library"
-    5 -> "search"
-    6 -> "categories"
-    else -> "home"
+    0 -> "music"       // Temporarily routing Discover/Home to the music player
+    1 -> "search"      
+    2 -> "library"     
+    3 -> "personality" 
+    else -> "music"
 }
 
 private fun String.isLibraryOrSettingsRouteForMusicMiniPlayer(): Boolean {
@@ -592,7 +590,6 @@ private fun String.isLibraryOrSettingsRouteForMusicMiniPlayer(): Boolean {
         this == "downloads" ||
         this == "musicLibrary" ||
         this == "musicPlaylists" ||
-        this == "savedShorts" ||
         startsWith("settings")
 }
 

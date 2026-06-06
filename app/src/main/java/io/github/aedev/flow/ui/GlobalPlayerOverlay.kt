@@ -774,7 +774,7 @@ fun GlobalPlayerOverlay(
                         VideoPlayerSurface(
                             video = video,
                             resizeMode = screenState.resizeMode,
-                            modifier = Modifier.fillMaxSize(),
+                            modifier = Modifier.size(0.dp),
                             onVideoAspectRatioChanged = { videoAspectRatio = it },
                             cornerRadiusDp = if (isMinimized && !localIsInPipMode) 12f else 0f
                         )
