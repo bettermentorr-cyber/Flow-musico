@@ -74,11 +74,13 @@ class ViewHistory private constructor(private val context: Context) {
         channelName: String = "",
         channelId: String = "",
         isMusic: Boolean = false,
-        isShort: Boolean = false
+        isShort: Boolean = false,
+        isLocal: Boolean = false
     ) {
-        if (PlayerPreferences(context).isDeepFlowCurrentlyActive()) return
+        val prefs = PlayerPreferences(context)
+        if (prefs.isDeepFlowCurrentlyActive() && !prefs.isDeepFlowSaveToHistoryEnabled()) return
 
-        val thumbnail = ThumbnailUrlResolver.normalizeVideoThumbnail(videoId, thumbnailUrl)
+        val thumbnail = if (isLocal) thumbnailUrl else ThumbnailUrlResolver.normalizeVideoThumbnail(videoId, thumbnailUrl)
         dao.upsert(
             WatchHistoryEntity(
                 videoId      = videoId,
@@ -90,10 +92,13 @@ class ViewHistory private constructor(private val context: Context) {
                 channelName  = channelName,
                 channelId    = channelId,
                 isMusic      = isMusic,
-                isShort      = isShort
+                isShort      = isShort,
+                isLocal      = isLocal
             )
         )
     }
+
+    suspend fun getSavedPosition(videoId: String): Long = dao.getPosition(videoId) ?: 0L
 
     /**
      * Create-or-touch a history entry **without** overwriting an already-saved
@@ -109,7 +114,8 @@ class ViewHistory private constructor(private val context: Context) {
         duration: Long = 0L,
         isShort: Boolean = false
     ) {
-        if (PlayerPreferences(context).isDeepFlowCurrentlyActive()) return
+        val prefs = PlayerPreferences(context)
+        if (prefs.isDeepFlowCurrentlyActive() && !prefs.isDeepFlowSaveToHistoryEnabled()) return
 
         val thumbnail = ThumbnailUrlResolver.normalizeVideoThumbnail(videoId, thumbnailUrl)
         val existingPosition = dao.getPosition(videoId) ?: 0L  // preserve saved progress
@@ -269,7 +275,8 @@ data class VideoHistoryEntry(
     val channelName: String = "",
     val channelId: String = "",
     val isMusic: Boolean = false,
-    val isShort: Boolean = false
+    val isShort: Boolean = false,
+    val isLocal: Boolean = false
 ) {
     val progressPercentage: Float
         get() = if (duration > 0) (position.toFloat() / duration.toFloat()) * 100f else 0f

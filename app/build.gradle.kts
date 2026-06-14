@@ -10,7 +10,7 @@ plugins {
 
 android {
     namespace = "io.github.aedev.flow"
-    compileSdk = 34
+    compileSdk = 35
 
     defaultConfig {
         applicationId = "io.github.aedev.flow"
@@ -185,7 +185,8 @@ dependencies {
     implementation(libs.androidx.constraintlayout.compose)
 
     // --- Image Loading ---
-    implementation(libs.coil.compose) 
+    implementation(libs.coil.compose)
+    implementation(libs.coil.video)
     implementation(libs.picasso)
     implementation("androidx.palette:palette-ktx:1.0.0")
 
