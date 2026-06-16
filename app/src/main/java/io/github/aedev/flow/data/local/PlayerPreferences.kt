@@ -32,6 +32,8 @@ class PlayerPreferences(context: Context) {
         val DEFAULT_VIDEO_CODEC = stringPreferencesKey("default_video_codec")
         val BACKGROUND_PLAY_ENABLED = booleanPreferencesKey("background_play_enabled")
         val AUTOPLAY_ENABLED = booleanPreferencesKey("autoplay_enabled")
+        val AUTOPLAY_COUNTDOWN_SECONDS = intPreferencesKey("autoplay_countdown_seconds")
+        val SHOW_CONTROLS_WHILE_LOADING = booleanPreferencesKey("show_controls_while_loading")
         val VIDEO_LOOP_ENABLED = booleanPreferencesKey("video_loop_enabled")
         val SUBTITLES_ENABLED = booleanPreferencesKey("subtitles_enabled")
         val PREFERRED_SUBTITLE_LANGUAGE = stringPreferencesKey("preferred_subtitle_language")
@@ -215,6 +217,7 @@ class PlayerPreferences(context: Context) {
         // Content filtering
         val HIDE_WATCHED_VIDEOS = booleanPreferencesKey("hide_watched_videos")
         val DISABLE_SHORTS_PLAYER = booleanPreferencesKey("disable_shorts_player")
+        val SHARE_WITHOUT_TEXT = booleanPreferencesKey("share_without_text")
 
         // Shorts background playback
         val SHORTS_BACKGROUND_PLAY = booleanPreferencesKey("shorts_background_play")
@@ -836,6 +839,28 @@ class PlayerPreferences(context: Context) {
         }
     }
 
+    val autoplayCountdownSeconds: Flow<Int> = context.playerPreferencesDataStore.data
+        .map { preferences ->
+            (preferences[Keys.AUTOPLAY_COUNTDOWN_SECONDS] ?: 0).coerceIn(0, 30)
+        }
+
+    suspend fun setAutoplayCountdownSeconds(seconds: Int) {
+        context.playerPreferencesDataStore.edit { preferences ->
+            preferences[Keys.AUTOPLAY_COUNTDOWN_SECONDS] = seconds.coerceIn(0, 30)
+        }
+    }
+
+    val showControlsWhileLoading: Flow<Boolean> = context.playerPreferencesDataStore.data
+        .map { preferences ->
+            preferences[Keys.SHOW_CONTROLS_WHILE_LOADING] ?: false
+        }
+
+    suspend fun setShowControlsWhileLoading(enabled: Boolean) {
+        context.playerPreferencesDataStore.edit { preferences ->
+            preferences[Keys.SHOW_CONTROLS_WHILE_LOADING] = enabled
+        }
+    }
+
     // Video Loop
     val videoLoopEnabled: Flow<Boolean> = context.playerPreferencesDataStore.data
         .map { preferences ->
@@ -1418,6 +1443,18 @@ class PlayerPreferences(context: Context) {
     suspend fun setHideWatchedVideos(enabled: Boolean) {
         context.playerPreferencesDataStore.edit { preferences ->
             preferences[Keys.HIDE_WATCHED_VIDEOS] = enabled
+        }
+    }
+
+    /** When ON, sharing a video link sends only the bare URL, without the "Check out this video" text. */
+    val shareWithoutText: Flow<Boolean> = context.playerPreferencesDataStore.data
+        .map { preferences ->
+            preferences[Keys.SHARE_WITHOUT_TEXT] ?: false
+        }
+
+    suspend fun setShareWithoutText(enabled: Boolean) {
+        context.playerPreferencesDataStore.edit { preferences ->
+            preferences[Keys.SHARE_WITHOUT_TEXT] = enabled
         }
     }
 
