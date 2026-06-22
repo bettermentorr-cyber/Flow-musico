@@ -1,11 +1,15 @@
 FLOW CHANGE LOG
 VERSION: 2.1.6
-DATE: 2026-06-15
+DATE: 2026-06-22
 STATUS: PRE-RELEASE
 
 NEW FEATURES
 - Add a local media library (play local on-device media)
 - Add new logo #605 by @AnharHussainMiah
+- Add new music recognizer feature (Based on Metrolist's implementation see https://github.com/MetrolistGroup/Metrolist)
+- Add custom mark as watched threshold settings
+- Add bottom navbar scroll events toggle
+- Add queue/playlist autoplay toggle
 
 IMPROVEMENTS
 - Improve media notification handling #577
@@ -24,6 +28,7 @@ IMPROVEMENTS
 - Add toggle to show/hide overlay #604
 - Add a delay config for autoplay #620
 - Improve Emojis handling in live chat #617
+- Improve chapters container #588
 
 FIXES AND STABILITY
 - Fix Crashes from missing media notification provider #578
@@ -34,3 +39,5 @@ FIXES AND STABILITY
 - Fix lag when the bottom navigation bar hides or shows while scrolling
 - Fix playback crashes
 - Fix missing audio tracks
+- Fix "Failed to parse video data" errors 
+- Fix videos playing in the wrong (AI-dubbed) audio language on some networks by always preferring the original audio track
