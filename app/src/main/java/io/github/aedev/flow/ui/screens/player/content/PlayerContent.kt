@@ -21,8 +21,6 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
-import androidx.compose.ui.platform.LocalDensity
-import androidx.compose.ui.platform.LocalLayoutDirection
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
@@ -36,6 +34,7 @@ import io.github.aedev.flow.data.model.DeArrowResult
 import io.github.aedev.flow.data.model.Video
 import io.github.aedev.flow.data.repository.DeArrowRepository
 import io.github.aedev.flow.player.EnhancedPlayerManager
+import io.github.aedev.flow.player.GlobalPlayerState
 import io.github.aedev.flow.player.PictureInPictureHelper
 import io.github.aedev.flow.player.state.EnhancedPlayerState
 import io.github.aedev.flow.ui.components.Media3SubtitleOverlay
@@ -45,7 +44,6 @@ import io.github.aedev.flow.ui.screens.player.VideoPlayerViewModel
 import io.github.aedev.flow.ui.screens.player.components.*
 import io.github.aedev.flow.ui.screens.player.state.PlayerScreenState
 import kotlinx.coroutines.CoroutineScope
-import kotlin.math.max
 
 @UnstableApi
 @Composable
@@ -72,6 +70,8 @@ fun PlayerContent(
     val doubleTapSeekSeconds by playerPrefs.doubleTapSeekSeconds.collectAsState(initial = 10)
     val allowVolumeBoost by playerPrefs.allowVolumeBoost.collectAsState(initial = false)
     val longPressPlaybackSpeed by playerPrefs.longPressPlaybackSpeed.collectAsState(initial = 2.0f)
+    val ambientModeEnabled by playerPrefs.videoAmbientModeEnabled.collectAsState(initial = false)
+    val isInPipMode by GlobalPlayerState.isInPipMode.collectAsState()
     val deArrowResult by produceState<DeArrowResult?>(
         initialValue = null,
         key1 = video.id,
@@ -92,23 +92,6 @@ fun PlayerContent(
             screenState.volumeLevel = 1f
         }
     }
-
-    val density = LocalDensity.current
-    val layoutDirection = LocalLayoutDirection.current
-    val leftSafeInset = with(density) {
-        max(
-            WindowInsets.displayCutout.getLeft(this, layoutDirection),
-            WindowInsets.systemBars.getLeft(this, layoutDirection)
-        ).toDp()
-    }
-    val rightSafeInset = with(density) {
-        max(
-            WindowInsets.displayCutout.getRight(this, layoutDirection),
-            WindowInsets.systemBars.getRight(this, layoutDirection)
-        ).toDp()
-    }
-    val leftGestureOverlayPadding = maxOf(leftSafeInset + 36.dp, 72.dp)
-    val rightGestureOverlayPadding = maxOf(rightSafeInset + 36.dp, 72.dp)
 
     Box(
         modifier = Modifier
@@ -157,7 +140,8 @@ fun PlayerContent(
         VideoPlayerSurface(
             video = video,
             resizeMode = screenState.resizeMode,
-            modifier = Modifier.fillMaxSize()
+            modifier = Modifier.fillMaxSize(),
+            ambientMode = ambientModeEnabled
         )
 
         Media3SubtitleOverlay(
@@ -169,40 +153,10 @@ fun PlayerContent(
             modifier = Modifier.fillMaxSize()
         )
         
-        // Seek animations
-        SeekAnimationOverlay(
-            showSeekBack = screenState.showSeekBackAnimation,
-            showSeekForward = screenState.showSeekForwardAnimation,
-            seekSeconds = screenState.seekAccumulation,
-            modifier = Modifier.align(Alignment.Center)
-        )
-        
-        // Brightness overlay
-        BrightnessOverlay(
-            isVisible = screenState.showBrightnessOverlay,
-            brightnessLevel = screenState.brightnessLevel,
-            modifier = Modifier
-                .align(Alignment.CenterStart)
-                .padding(start = leftGestureOverlayPadding)
-        )
-        
-        // Volume overlay
-        VolumeOverlay(
-            isVisible = screenState.showVolumeOverlay,
-            volumeLevel = screenState.volumeLevel,
-            maxVolumeLevel = if (allowVolumeBoost) 2f else 1f,
-            modifier = Modifier
-                .align(Alignment.CenterEnd)
-                .padding(end = rightGestureOverlayPadding)
-        )
-        
-        // Speed boost overlay
-        SpeedBoostOverlay(
-            isVisible = screenState.isSpeedBoostActive,
-            speed = longPressPlaybackSpeed,
-            modifier = Modifier
-                .align(Alignment.TopCenter)
-                .padding(top = 0.dp)
+        PlayerGestureOverlays(
+            screenState = screenState,
+            allowVolumeBoost = allowVolumeBoost,
+            speedBoostSpeed = longPressPlaybackSpeed
         )
 
         // ── Error overlay — icon + title only; details/actions live in the body panel ──
@@ -240,7 +194,7 @@ fun PlayerContent(
         // Custom Controls Overlay
         var showRemainingTime by rememberSaveable { mutableStateOf(false) }
         PremiumControlsOverlay(
-            isVisible = (screenState.showControls || screenState.isTouchLocked) && !screenState.isInPipMode,
+            isVisible = (screenState.showControls || screenState.isTouchLocked) && !isInPipMode,
             isPlaying = playerState.isPlaying,
             hasEnded = playerState.hasEnded,
             isBuffering = playerState.isBuffering,
@@ -292,7 +246,6 @@ fun PlayerContent(
                     )
                 }
             },
-            seekbarPreviewHelper = screenState.seekbarPreviewHelper,
             chapters = uiState.chapters,
                             onChapterClick = { screenState.showChaptersSheet = true },
                             onSubtitleClick = {
@@ -370,7 +323,7 @@ fun PlayerContent(
             }
         )
 
-        if (!screenState.isInPipMode) {
+        if (!isInPipMode) {
             AutoplayCountdownOverlay()
         }
     }

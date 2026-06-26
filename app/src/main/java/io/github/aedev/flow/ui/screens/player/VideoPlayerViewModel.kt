@@ -7,7 +7,6 @@ import androidx.lifecycle.viewModelScope
 import io.github.aedev.flow.data.local.*
 import io.github.aedev.flow.data.model.Video
 import io.github.aedev.flow.data.local.entity.WatchHistoryEntity
-import io.github.aedev.flow.data.recommendation.InterestProfile
 import io.github.aedev.flow.data.recommendation.FlowNeuroEngine
 import io.github.aedev.flow.ui.components.FeedInvalidationBus
 import io.github.aedev.flow.data.recommendation.InteractionType
@@ -17,6 +16,7 @@ import io.github.aedev.flow.player.EnhancedMusicPlayerManager
 import io.github.aedev.flow.player.GlobalPlayerState
 import io.github.aedev.flow.utils.ThumbnailUrlResolver
 import io.github.aedev.flow.player.quality.QualityManager
+import io.github.aedev.flow.player.stream.StreamMergeUtils
 import io.github.aedev.flow.player.stream.VideoCodecUtils
 import io.github.aedev.flow.innertube.YouTube
 import io.github.aedev.flow.innertube.models.YouTubeClient
@@ -69,7 +69,6 @@ class VideoPlayerViewModel @Inject constructor(
     private val subscriptionRepository: SubscriptionRepository,
     private val likedVideosRepository: LikedVideosRepository,
     private val playlistRepository: io.github.aedev.flow.data.local.PlaylistRepository,
-    private val interestProfile: InterestProfile,
     private val playerPreferences: PlayerPreferences,
     private val videoDownloadManager: VideoDownloadManager,
     private val sponsorBlockRepository: SponsorBlockRepository,
@@ -96,10 +95,8 @@ class VideoPlayerViewModel @Inject constructor(
     private val navigationHistory = mutableListOf<String>()
     private var currentHistoryIndex = -1
 
-    // Dedup guard for reportWatchProgress — prevents double-reporting when the
-    // DisposableEffect fires multiple times for the same video.
+    // One terminal watch signal per video view; ignores repeat dispose fires.
     private var lastReportedVideoId: String? = null
-    private var lastReportedTimestamp: Long = 0L
     private var activeLoadJob: Job? = null
     private var playbackLoadToken: Long = 0L
     private var loadingVideoId: String? = null
@@ -294,8 +291,6 @@ class VideoPlayerViewModel @Inject constructor(
             EnhancedPlayerManager.getInstance().playerState.collect { playerState ->
                 _uiState.update {
                     it.copy(
-                        hasNext = playerState.hasNext,
-                        hasPrevious = playerState.hasPrevious,
                         queueTitle = playerState.queueTitle
                     )
                 }
@@ -1137,8 +1132,8 @@ class VideoPlayerViewModel @Inject constructor(
                         } ?: emptyList()
 
                         val extractorVideoStreams = (streamInfo.videoStreams + streamInfo.videoOnlyStreams).filterIsInstance<VideoStream>()
-                        val effectiveVideoStreams: List<VideoStream> = mergeVideoStreams(extractorVideoStreams, innerTubeVideoStreams)
-                        val effectiveAudioStreams: List<AudioStream> = mergeAudioStreams(streamInfo.audioStreams, innerTubeAudioStreams)
+                        val effectiveVideoStreams: List<VideoStream> = StreamMergeUtils.mergeVideoStreams(extractorVideoStreams, innerTubeVideoStreams)
+                        val effectiveAudioStreams: List<AudioStream> = StreamMergeUtils.mergeAudioStreams(streamInfo.audioStreams, innerTubeAudioStreams)
 
                         if (extractorVideoStreams.isNotEmpty()) {
                             Log.i("VideoPlayerViewModel", "Using NewPipe streams: ${extractorVideoStreams.size} video, ${streamInfo.audioStreams.size} audio (merged=${effectiveVideoStreams.size})")
@@ -1979,11 +1974,11 @@ class VideoPlayerViewModel @Inject constructor(
             val codecPref = playerPreferences.defaultVideoCodec.first().codecKey
             val innerTubeVideoStreams = InnerTubeStreamBridge.convertVideoFormats(state.innerTubeVideoFormats)
             val innerTubeAudioStreams = InnerTubeStreamBridge.convertAudioFormats(state.innerTubeAudioFormats)
-            val effectiveVideo = mergeVideoStreams(
+            val effectiveVideo = StreamMergeUtils.mergeVideoStreams(
                 innerTubeVideoStreams,
                 (streamInfo.videoStreams + streamInfo.videoOnlyStreams).filterIsInstance<VideoStream>()
             )
-            val effectiveAudio: List<AudioStream> = mergeAudioStreams(innerTubeAudioStreams, streamInfo.audioStreams)
+            val effectiveAudio: List<AudioStream> = StreamMergeUtils.mergeAudioStreams(innerTubeAudioStreams, streamInfo.audioStreams)
             val streams = selectStreamsFromLists(effectiveVideo, effectiveAudio, quality, audioLangPref, codecPref)
 
             _uiState.value = state.copy(
@@ -2065,15 +2060,6 @@ class VideoPlayerViewModel @Inject constructor(
                 channelId = channelId,
                 isLocal = isLocal
             )
-            if (duration > 0 && !isLocal && !playerPreferences.isDeepFlowCurrentlyActive()) {
-                interestProfile.recordWatch(
-                    videoTitle = title,
-                    channelId = channelId,
-                    channelName = channelName,
-                    watchDuration = (position / 1000).toInt(),
-                    totalDuration = (duration / 1000).toInt()
-                )
-            }
         }
     }
     
@@ -2081,14 +2067,11 @@ class VideoPlayerViewModel @Inject constructor(
         if (duration <= 0) return
         if (isLocalMediaId(video.id)) return
         val watchFraction = position.toDouble() / duration
-        // Only report if watched at least 20% and not already reported for this video
-        // within a 10-second dedup window (guards against DisposableEffect re-fires).
-        val now = System.currentTimeMillis()
-        if (video.id == lastReportedVideoId && (now - lastReportedTimestamp) < 10_000L) return
+        // One terminal signal per video view; ignore repeat dispose fires.
+        if (video.id == lastReportedVideoId) return
         if (watchFraction < 0.20) return
 
         lastReportedVideoId = video.id
-        lastReportedTimestamp = now
 
         val interactionType = when {
             watchFraction >= 0.85 -> InteractionType.WATCHED
@@ -2121,7 +2104,6 @@ class VideoPlayerViewModel @Inject constructor(
                     )
                 )
                 _uiState.value = _uiState.value.copy(isSubscribed = true)
-                interestProfile.recordSubscription(channelId, channelName)
             }
         }
     }
@@ -2131,6 +2113,27 @@ class VideoPlayerViewModel @Inject constructor(
             subscriptionRepository.updateNotificationState(channelId, enabled)
             _uiState.value = _uiState.value.copy(isNotificationsEnabled = enabled)
         }
+    }
+
+    // Rich Video for the currently-open item, used to feed strong learning signals
+    // (tags/description/duration) instead of a title-only stub.
+    private fun resolveRichVideo(videoId: String): Video? {
+        val state = _uiState.value
+        return state.cachedVideo?.takeIf { it.id == videoId }
+            ?: state.streamInfo?.takeIf { it.id == videoId }?.let { info ->
+                Video(
+                    id = videoId,
+                    title = info.name ?: "",
+                    channelName = info.uploaderName ?: "",
+                    channelId = info.uploaderUrl?.split("/")?.last() ?: "",
+                    thumbnailUrl = info.thumbnails.maxByOrNull { it.height }?.url ?: "",
+                    duration = info.duration.toInt(),
+                    viewCount = info.viewCount,
+                    uploadDate = "",
+                    description = info.description?.content ?: "",
+                    tags = info.tags ?: emptyList()
+                )
+            }
     }
 
     fun likeVideo(videoId: String, title: String, thumbnail: String, channelName: String, channelId: String = "") {
@@ -2144,9 +2147,8 @@ class VideoPlayerViewModel @Inject constructor(
                 )
             )
             _uiState.value = _uiState.value.copy(likeState = "LIKED")
-            interestProfile.recordLike(title, channelId, channelName)
             try {
-                val video = Video(
+                val video = resolveRichVideo(videoId) ?: Video(
                     id = videoId,
                     title = title,
                     channelName = channelName,
@@ -2160,34 +2162,15 @@ class VideoPlayerViewModel @Inject constructor(
             } catch (e: Exception) { }
         }
     }
-    
+
     fun dislikeVideo(videoId: String) {
         viewModelScope.launch {
             likedVideosRepository.dislikeVideo(videoId)
             _uiState.value = _uiState.value.copy(likeState = "DISLIKED")
             try {
-                val state = _uiState.value
-                val video = state.cachedVideo?.takeIf { it.id == videoId }
-                    ?: state.streamInfo?.takeIf { it.id == videoId }?.let { info ->
-                        Video(
-                            id = videoId,
-                            title = info.name ?: "",
-                            channelName = info.uploaderName ?: "",
-                            channelId = info.uploaderUrl?.split("/")?.last() ?: "",
-                            thumbnailUrl = info.thumbnails.maxByOrNull { it.height }?.url ?: "",
-                            duration = info.duration.toInt(),
-                            viewCount = info.viewCount,
-                            uploadDate = "",
-                            description = info.description?.content ?: "",
-                            tags = info.tags ?: emptyList()
-                        )
-                    }
+                val video = resolveRichVideo(videoId)
                 if (video != null) {
-                    FlowNeuroEngine.onVideoInteraction(
-                        context,
-                        video,
-                        InteractionType.DISLIKED
-                    )
+                    FlowNeuroEngine.onVideoInteraction(context, video, InteractionType.DISLIKED)
                 }
             } catch (e: Exception) {
                 Log.w("VideoPlayerViewModel", "Failed to record dislike", e)
@@ -2355,40 +2338,6 @@ class VideoPlayerViewModel @Inject constructor(
                 Log.e("VideoPlayerViewModel", "Error loading more replies", e)
             }
         }
-    }
-
-    private fun mergeVideoStreams(
-        primary: List<VideoStream>,
-        fallback: List<VideoStream>
-    ): List<VideoStream> {
-        return (primary + fallback)
-            .filter { it.getContent().isNotBlank() }
-            .distinctBy { stream ->
-                val url = stream.getContent()
-                if (url.isNotBlank()) url else "${VideoCodecUtils.qualityHeightFromStream(stream)}_${VideoCodecUtils.codecKeyFromStream(stream)}_${stream.bitrate}"
-            }
-            .sortedWith(
-                compareByDescending<VideoStream> { QualityManager.normalizeQualityHeight(VideoCodecUtils.qualityHeightFromStream(it)) }
-                    .thenBy { VideoCodecUtils.playbackCodecRank(it) }
-                    .thenByDescending { it.bitrate }
-            )
-    }
-
-    private fun mergeAudioStreams(
-        primary: List<AudioStream>,
-        fallback: List<AudioStream>
-    ): List<AudioStream> {
-        return (primary + fallback)
-            .filter { it.getContent().isNotBlank() }
-            .distinctBy { stream ->
-                listOf(
-                    stream.getContent(),
-                    stream.format?.mimeType.orEmpty(),
-                    stream.audioTrackId.orEmpty(),
-                    stream.averageBitrate.takeIf { it > 0 } ?: stream.bitrate
-                ).joinToString("|")
-            }
-            .sortedByDescending { it.averageBitrate.takeIf { bitrate -> bitrate > 0 } ?: it.bitrate }
     }
 
     private fun selectStreamsFromLists(
@@ -2612,8 +2561,6 @@ data class VideoPlayerUiState(
     val localFileVideoId: String? = null,
     val metadataError: String? = null,
     val dislikeCount: Long? = null,
-    val hasNext: Boolean = false,
-    val hasPrevious: Boolean = false,
     val queueTitle: String? = null,
     val hlsUrl: String? = null,
     val shouldDismissPlayer: Boolean = false,

@@ -457,9 +457,8 @@ class ShortsRepository private constructor(private val context: Context) {
             val rankedIds = ranked.map { it.id }
             val shortById = candidates.associateBy { it.id }
             val reRanked = rankedIds.mapNotNull { shortById[it] }
-            FlowNeuroEngine.recordFeedImpressions(listOf(pinned.toVideo()) + ranked)
             Log.d(TAG, "✓ FlowNeuro re-ranked ${reRanked.size} shorts")
-            orderShortsNewestFirst(listOf(pinned) + reRanked)
+            listOf(pinned) + reRanked
         } catch (e: Exception) {
             Log.w(TAG, "FlowNeuro re-ranking failed, using original order: ${e.message}")
             orderShortsNewestFirst(shorts)
@@ -813,7 +812,8 @@ class ShortsRepository private constructor(private val context: Context) {
     suspend fun getHomeFeedShorts(): List<ShortVideo> = withContext(Dispatchers.IO) {
         try {
             val result = getShortsFeed()
-            orderShortsNewestFirst(filterWatchedShorts(result.shorts)).take(20)
+            val ordered = orderShortsNewestFirst(filterWatchedShorts(result.shorts)).take(20)
+            withTimeoutOrNull(ENRICHMENT_TIMEOUT_MS) { enrichMissingMetadata(ordered) } ?: ordered
         } catch (e: Exception) {
             Log.e(TAG, "Failed to get home feed shorts", e)
             emptyList()

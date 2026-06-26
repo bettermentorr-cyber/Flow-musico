@@ -5,8 +5,14 @@ import android.util.Log
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import io.github.aedev.flow.data.recommendation.FlowNeuroEngine
+import io.github.aedev.flow.data.recommendation.FlowPersona
+import io.github.aedev.flow.data.recommendation.SeedInput
+import io.github.aedev.flow.data.recommendation.UserBrain
+import io.github.aedev.flow.data.local.LikedVideosRepository
+import io.github.aedev.flow.data.local.PlaylistRepository
 import io.github.aedev.flow.data.local.SubscriptionRepository
 import io.github.aedev.flow.data.local.ViewHistory
+import io.github.aedev.flow.data.local.VideoHistoryEntry
 import io.github.aedev.flow.data.model.Video
 import io.github.aedev.flow.data.model.toVideo
 import io.github.aedev.flow.data.repository.YouTubeRepository
@@ -25,24 +31,169 @@ import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.supervisorScope
 import kotlinx.coroutines.withTimeoutOrNull
+import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withPermit
 import org.schabi.newpipe.extractor.Page
 
 import dagger.hilt.android.lifecycle.HiltViewModel
+import dagger.hilt.android.qualifiers.ApplicationContext
 import javax.inject.Inject
+
+/** Seed candidates for related-graph retrieval: recent, mostly-watched, non-Short videos. */
+internal fun seedInputsFrom(history: List<VideoHistoryEntry>, max: Int = 10): List<SeedInput> =
+    history.filter { !it.isShort && it.progressPercentage >= 70f }
+        .sortedByDescending { it.timestamp }
+        .take(max)
+        .map { SeedInput(it.videoId, it.title, (it.progressPercentage / 100f).toDouble()) }
+
+/** Keeps only visible grid keys that map to real feed videos (drops shelf/loader keys). */
+internal fun feedImpressionIds(visibleKeys: List<String>, knownIds: Set<String>): List<String> =
+    visibleKeys.filter { it in knownIds }
+
+/** Saved-interest seed pools: watch history (newest-first), liked videos, and saved playlists. */
+internal data class SavedSeedSources(
+    val historyIds: List<String>,
+    val likedIds: List<String>,
+    val playlistIds: List<String>
+)
+
+private fun sampleIds(ids: List<String>, range: IntRange, random: kotlin.random.Random): List<String> {
+    if (ids.isEmpty() || range.last <= 0) return emptyList()
+    val n = random.nextInt(range.first, range.last + 1).coerceAtMost(ids.size)
+    return ids.shuffled(random).take(n)
+}
+
+/**
+ * Picks seed video ids to expand via the related (/next) graph: the latest watched video plus a
+ * random sample from history, liked, and saved playlists. Ids on cooldown are excluded.
+ */
+internal fun selectSavedInterestSeeds(
+    sources: SavedSeedSources,
+    cooldown: Set<String>,
+    random: kotlin.random.Random,
+    historyRandom: IntRange = 1..2,
+    likedPicks: IntRange = 1..2,
+    playlistPicks: IntRange = 1..4,
+    maxSeeds: Int = 5
+): List<String> {
+    val picked = LinkedHashSet<String>()
+    val history = sources.historyIds.filterNot { it in cooldown }
+    history.firstOrNull()?.let { picked.add(it) } 
+    picked += sampleIds(history.drop(1), historyRandom, random)
+    picked += sampleIds(sources.likedIds.filterNot { it in cooldown }, likedPicks, random)
+    picked += sampleIds(sources.playlistIds.filterNot { it in cooldown }, playlistPicks, random)
+    return picked.take(maxSeeds)
+}
+
+// Format signals often tied to low-effort feed filler. NOT a blocklist: they only demote
+// exploration candidates, and only when the user shows no matching interest.
+internal val FEED_FORMAT_MARKERS = listOf(
+    "compilation", "satisfying", "hour of", "hours of", "best of",
+    "ending explained", "full movie", "full episode", "marathon",
+    "movie recap", "series recap", "all parts"
+)
+
+// Per-persona long-form comfort. 0 ⇒ no duration demotion (the user watches long content).
+internal const val DURATION_COMFORT_DEFAULT_SEC = 3600 // 60 min: generic browse comfort
+private const val DURATION_COMFORT_SKIMMER_SEC = 1500 // 25 min: fast-content persona
+private const val FIT_PENALTY_WEIGHT = 0.6            // how hard a poor fit demotes engine rank
+
+/** Per-user feed taste, read from the learned brain — drives demotion, never a global ban. */
+internal data class FeedTasteProfile(
+    val comfortDurationSec: Int,
+    val affinityTopics: Set<String>
+)
+
+internal fun feedTasteProfile(brain: UserBrain, persona: FlowPersona): FeedTasteProfile {
+    val comfort = when (persona) {
+        FlowPersona.DEEP_DIVER, FlowPersona.SCHOLAR,
+        FlowPersona.BINGER, FlowPersona.AUDIOPHILE -> 0
+        FlowPersona.SKIMMER -> DURATION_COMFORT_SKIMMER_SEC
+        else -> DURATION_COMFORT_DEFAULT_SEC
+    }
+    val affinity = (brain.topicAffinities.filterValues { it > 0.0 }.keys + brain.preferredTopics)
+        .mapNotNull { it.lowercase().takeIf(String::isNotBlank) }
+        .toSet()
+    return FeedTasteProfile(comfort, affinity)
+}
+
+/** 0 = good fit for this user; →1 = poor fit. Demotes exploration candidates, never drops them. */
+internal fun feedFitPenalty(video: Video, profile: FeedTasteProfile): Double {
+    var penalty = 0.0
+    val cap = profile.comfortDurationSec
+    if (cap > 0 && video.duration > cap) {
+        val over = (video.duration - cap).toDouble() / cap
+        penalty += (0.5 * over).coerceAtMost(0.6)
+    }
+    val title = video.title.lowercase()
+    if (FEED_FORMAT_MARKERS.any { title.contains(it) } &&
+        profile.affinityTopics.none { title.contains(it) }
+    ) {
+        penalty += 0.4
+    }
+    return penalty.coerceAtMost(1.0)
+}
+
+/** Stable re-rank pushing poor-fit items below well-fit ones while preserving engine order. */
+internal fun demoteByFit(ranked: List<Video>, profile: FeedTasteProfile): List<Video> {
+    if (ranked.size < 2) return ranked
+    val n = ranked.size.toDouble()
+    return ranked.withIndex()
+        .sortedByDescending { (i, v) -> (1.0 - i / n) - FIT_PENALTY_WEIGHT * feedFitPenalty(v, profile) }
+        .map { it.value }
+}
+
+/**
+ * Greedy reorder that keeps same-channel items at least `gap` slots apart when possible; order is
+ * otherwise preserved. seedRecent primes the cooldown with the prior page's tail to space appends.
+ */
+internal fun spaceByChannel(
+    videos: List<Video>, gap: Int = 1, seedRecent: List<String> = emptyList()
+): List<Video> {
+    if (videos.size < 2) return videos
+    val remaining = videos.toMutableList()
+    val out = ArrayList<Video>(videos.size)
+    val recent = ArrayDeque<String>()
+    seedRecent.takeLast(gap).forEach { recent.addLast(it) }
+    while (remaining.isNotEmpty()) {
+        val idx = remaining.indexOfFirst { it.channelId.isBlank() || it.channelId !in recent }
+            .let { if (it < 0) 0 else it }
+        val pick = remaining.removeAt(idx)
+        out.add(pick)
+        if (pick.channelId.isNotBlank()) {
+            recent.addLast(pick.channelId)
+            while (recent.size > gap) recent.removeFirst()
+        }
+    }
+    return out
+}
 
 @HiltViewModel
 class HomeViewModel @Inject constructor(
     private val repository: YouTubeRepository,
     private val subscriptionRepository: SubscriptionRepository, 
     private val shortsRepository: ShortsRepository,
-    private val playerPreferences: io.github.aedev.flow.data.local.PlayerPreferences
+    private val playerPreferences: io.github.aedev.flow.data.local.PlayerPreferences,
+    @ApplicationContext private val appContext: Context
 ) : ViewModel() {
     companion object {
         private const val TAG = "HomeViewModel"
         private const val HOME_TARGET_SIZE = 40
         private const val FRESH_SUB_WINDOW_MS = 72L * 60L * 60L * 1000L
         private const val HOME_MAX_SUGGESTION_AGE_MS = 365L * 24L * 60L * 60L * 1000L
+        private const val RELATED_TTL_MS = 45L * 60L * 1000L
+        private const val MAX_RELATED_SEEDS = 4
+        private const val MIN_PAGE_SIZE = 8
+        private const val MAX_SAVED_SEEDS = 5
+        private const val SAVED_RELATED_SLOTS = 8
+        private const val SAVED_SEED_COOLDOWN_MS = 3L * 60L * 60L * 1000L
     }
+
+    // Saved-interest enrichment sources (history/liked/playlists) + per-seed cooldown.
+    private val likedVideosRepository by lazy { LikedVideosRepository.getInstance(appContext) }
+    private val playlistRepository by lazy { PlaylistRepository(appContext) }
+    private val historyRepository by lazy { ViewHistory.getInstance(appContext) }
+    private val savedSeedCooldown = java.util.concurrent.ConcurrentHashMap<String, Long>()
 
     
     private val _uiState = MutableStateFlow(HomeUiState())
@@ -51,6 +202,8 @@ class HomeViewModel @Inject constructor(
     private var currentPage: Page? = null
     private var isLoadingMore = false
     private var isInitialized = false
+
+    private var subsBacklog: List<Video> = emptyList()
     
     private var currentQueryIndex = 0
     private val discoveryQueries = mutableListOf<String>()
@@ -62,6 +215,11 @@ class HomeViewModel @Inject constructor(
 
     // Video IDs the user has watched >=90 % — excluded from recommendations.
     private val watchedVideoIds = MutableStateFlow<Set<String>>(emptySet())
+
+    // Related-graph (/next) per-seed cache, keyed by seed video id.
+    private data class CachedRelated(val videos: List<Video>, val ts: Long)
+    private val relatedCache = java.util.concurrent.ConcurrentHashMap<String, CachedRelated>()
+    private val relatedSemaphore = Semaphore(3)
     
     init {
         if (HomeFeedCache.isFresh()) {
@@ -257,6 +415,11 @@ class HomeViewModel @Inject constructor(
                         }.getOrElse { emptyList() }
                     }
 
+                    // ── Related-graph lane: harvest /next neighbours of recent positives ──
+                    val deferredRelated = async {
+                        fetchRelatedFor(FlowNeuroEngine.selectRelatedSeeds(buildSeedInputs(), MAX_RELATED_SEEDS))
+                    }
+
                     // ── Fast first paint ────────────────────────────────────────
                     val viralResult = deferredViral.await()
                     if (viralResult.isNotEmpty() && userSubs.isEmpty()) {
@@ -275,14 +438,16 @@ class HomeViewModel @Inject constructor(
                                     isFlowFeed = true
                                 )
                             }
-                            FlowNeuroEngine.recordFeedImpressions(quickFeed)
                         }
                     }
 
-                    Triple(deferredSubs.await(), deferredDiscovery.await(), viralResult)
+                    listOf(deferredSubs.await(), deferredDiscovery.await(), viralResult, deferredRelated.await())
                 }
-                
-                val (rawSubs, rawDiscovery, rawViral) = results
+
+                val rawSubs = results[0]
+                val rawDiscovery = results[1]
+                val rawViral = results[2]
+                val rawRelated = results[3]
 
                 Log.d(TAG, "Wave 1 fetch completed in ${System.currentTimeMillis() - fetchStart}ms")
 
@@ -302,6 +467,8 @@ class HomeViewModel @Inject constructor(
 
                 // Extract shorts from all sources for the shelf, ranked by FlowNeuro
                 val now = System.currentTimeMillis()
+                val brain = FlowNeuroEngine.getBrainSnapshot()
+                val taste = feedTasteProfile(brain, FlowNeuroEngine.getPersona(brain))
 
                 val feedShorts = (rawSubs.extractShorts() + rawDiscovery.extractShorts() + rawViral.extractShorts())
                     .distinctBy { it.id }
@@ -309,16 +476,9 @@ class HomeViewModel @Inject constructor(
                     .filterRecentHomeSuggestion(now)
                 if (feedShorts.isNotEmpty() && playerPreferences.homeShortsShelfEnabled.first()) {
                     val rankedShorts = FlowNeuroEngine.rank(feedShorts, userSubs)
-                    val rankIndex = rankedShorts.mapIndexed { index, video -> video.id to index }.toMap()
-                    val latestShorts = feedShorts.sortedWith(
-                        compareByDescending<Video> { it.timestamp }
-                            .thenBy { rankIndex[it.id] ?: Int.MAX_VALUE }
-                    )
                     _uiState.update { state ->
-                        state.copy(shorts = (state.shorts + latestShorts).distinctBy { it.id }
-                            .sortedByDescending { it.timestamp })
+                        state.copy(shorts = (state.shorts + rankedShorts).distinctBy { it.id })
                     }
-                    FlowNeuroEngine.recordFeedImpressions(rankedShorts)
                 }
                 
                 // Filter to regular videos for the main feed
@@ -334,19 +494,24 @@ class HomeViewModel @Inject constructor(
                     "Flow candidates: subs=${subsPool.size}, discovery=${discoveryPool.size}, viral=${viralPool.size}, subCount=${userSubs.size}"
                 )
 
-                val rankedSubs = FlowNeuroEngine.rank(subsPool, userSubs)
+                val subsByRecency = subsPool.sortedByDescending { it.timestamp }
                 val freshSlotTarget = dynamicFreshSubSlots(userSubs.size)
-                val freshSubsLane = rankedSubs
+                val freshSubsLane = subsByRecency
                     .filter { isFreshSubscribedCandidate(it, now) }
                     .take(freshSlotTarget)
                 val freshIds = freshSubsLane.map { it.id }.toHashSet()
 
+                val rankedSubs = FlowNeuroEngine.rank(subsPool, userSubs)
                 val bestSubs = rankedSubs
                     .filter { !freshIds.contains(it.id) }
                     .take(15)
 
-                val bestDiscovery = FlowNeuroEngine.rank(discoveryPool, userSubs).take(15)
-                val bestViral = FlowNeuroEngine.rank(viralPool, userSubs).take(6)
+                val bestDiscovery = demoteByFit(FlowNeuroEngine.rank(discoveryPool, userSubs), taste).take(15)
+                val bestViral = demoteByFit(FlowNeuroEngine.rank(viralPool, userSubs), taste).take(6)
+
+                val relatedPool = rawRelated.filterValid().filterWatched(watched)
+                    .filterRecentHomeSuggestion(now)
+                val bestRelated = demoteByFit(FlowNeuroEngine.rank(relatedPool, userSubs), taste).take(12)
 
                 val finalMix = mutableListOf<Video>()
                 val usedChannelCounts = mutableMapOf<String, Int>()
@@ -357,26 +522,34 @@ class HomeViewModel @Inject constructor(
                 }
 
                 val remaining = (HOME_TARGET_SIZE - finalMix.size).coerceAtLeast(0)
-                val subsQuota = (remaining * 0.50).toInt().coerceAtLeast(0)
-                val discoveryQuota = (remaining * 0.40).toInt().coerceAtLeast(0)
-                val viralQuota = (remaining - subsQuota - discoveryQuota).coerceAtLeast(0)
-                
+                val subsQuota = (remaining * 0.40).toInt().coerceAtLeast(0)
+                val relatedQuota = (remaining * 0.25).toInt().coerceAtLeast(0)
+                val discoveryQuota = (remaining * 0.25).toInt().coerceAtLeast(0)
+                val viralQuota = (remaining - subsQuota - relatedQuota - discoveryQuota).coerceAtLeast(0)
+
                 val qSubs = java.util.ArrayDeque(bestSubs)
+                val qRelated = java.util.ArrayDeque(bestRelated)
                 val qDisc = java.util.ArrayDeque(bestDiscovery)
                 val qViral = java.util.ArrayDeque(bestViral)
 
                 var subsAdded = 0
+                var relatedAdded = 0
                 var discoveryAdded = 0
                 var viralAdded = 0
                 
                 while (
                     finalMix.size < HOME_TARGET_SIZE &&
-                    (qSubs.isNotEmpty() || qDisc.isNotEmpty() || qViral.isNotEmpty())
+                    (qSubs.isNotEmpty() || qRelated.isNotEmpty() || qDisc.isNotEmpty() || qViral.isNotEmpty())
                 ) {
                     var addedThisRound = false
 
                     if (subsAdded < subsQuota && addUnique(qSubs.pollFirst(), finalMix, usedChannelCounts, usedVideoIds)) {
                         subsAdded++
+                        addedThisRound = true
+                    }
+
+                    if (relatedAdded < relatedQuota && addUnique(qRelated.pollFirst(), finalMix, usedChannelCounts, usedVideoIds)) {
+                        relatedAdded++
                         addedThisRound = true
                     }
 
@@ -392,6 +565,7 @@ class HomeViewModel @Inject constructor(
 
                     if (!addedThisRound) {
                         val forced = addUnique(qSubs.pollFirst(), finalMix, usedChannelCounts, usedVideoIds) ||
+                            addUnique(qRelated.pollFirst(), finalMix, usedChannelCounts, usedVideoIds) ||
                             addUnique(qDisc.pollFirst(), finalMix, usedChannelCounts, usedVideoIds) ||
                             addUnique(qViral.pollFirst(), finalMix, usedChannelCounts, usedVideoIds)
                         if (!forced) break
@@ -399,12 +573,14 @@ class HomeViewModel @Inject constructor(
                 }
 
                 if (finalMix.size < HOME_TARGET_SIZE) {
-                    val fallback = bestSubs + bestDiscovery + bestViral
+                    val fallback = bestSubs + bestRelated + bestDiscovery + bestViral
                     fallback.forEach { video ->
                         if (finalMix.size >= HOME_TARGET_SIZE) return@forEach
                         addUnique(video, finalMix, usedChannelCounts, usedVideoIds)
                     }
                 }
+
+                subsBacklog = subsByRecency.filterNot { usedVideoIds.contains(it.id) }
 
                 if (finalMix.isEmpty()) {
                    loadTrendingFallback()
@@ -413,19 +589,22 @@ class HomeViewModel @Inject constructor(
 
                 Log.d(
                     TAG,
-                    "Flow mix: freshLane=${freshSubsLane.size}, final=${finalMix.size}, quotas=s:$subsQuota d:$discoveryQuota v:$viralQuota"
+                    "Flow mix: freshLane=${freshSubsLane.size}, final=${finalMix.size}, quotas=s:$subsQuota r:$relatedQuota d:$discoveryQuota v:$viralQuota"
                 )
 
+                val spacedMix = spaceByChannel(finalMix)
                 _uiState.update { it.copy(
-                    videos = finalMix, 
+                    videos = spacedMix,
                     isLoading = false,
                     isRefreshing = false,
                     hasMorePages = true,
                     isFlowFeed = true,
                     lastRefreshTime = now
                 )}
-                HomeFeedCache.update(finalMix, _uiState.value.shorts)
-                FlowNeuroEngine.recordFeedImpressions(finalMix)
+                HomeFeedCache.update(spacedMix, _uiState.value.shorts)
+
+                // Enrich (post-paint) with related neighbours of saved/watched videos.
+                enrichFeedWithSavedInterest(userSubs, taste)
 
                 // ── Wave 2: remaining queries loaded in background ──
                 val wave2Queries = discoveryQueries.drop(currentQueryIndex)
@@ -446,7 +625,7 @@ class HomeViewModel @Inject constructor(
                                 .filter { !wave2FinalMixIds.contains(it.id) }
                             if (wave2Valid.isEmpty()) return@wave2
 
-                            val wave2Ranked = FlowNeuroEngine.rank(wave2Valid, userSubs)
+                            val wave2Ranked = demoteByFit(FlowNeuroEngine.rank(wave2Valid, userSubs), taste)
                                 .take(15)
 
                             if (wave2Ranked.isNotEmpty()) {
@@ -459,7 +638,6 @@ class HomeViewModel @Inject constructor(
                                     HomeFeedCache.update(updated, state.shorts)
                                     state.copy(videos = updated)
                                 }
-                                FlowNeuroEngine.recordFeedImpressions(wave2Ranked)
                                 currentQueryIndex = discoveryQueries.size
                                 Log.d(TAG, "Wave 2 merged ${wave2Ranked.size} extra candidates")
                             }
@@ -514,39 +692,45 @@ class HomeViewModel @Inject constructor(
                 if (moreShorts.isNotEmpty() && playerPreferences.homeShortsShelfEnabled.first()) {
                     val subs = subscriptionRepository.getAllSubscriptionIds()
                     val rankedMore = FlowNeuroEngine.rank(moreShorts, subs)
-                    val rankIndex = rankedMore.mapIndexed { index, video -> video.id to index }.toMap()
-                    val latestMore = moreShorts.sortedWith(
-                        compareByDescending<Video> { it.timestamp }
-                            .thenBy { rankIndex[it.id] ?: Int.MAX_VALUE }
-                    )
                     _uiState.update { state ->
-                        state.copy(shorts = (state.shorts + latestMore).distinctBy { it.id }
-                            .sortedByDescending { it.timestamp })
+                        state.copy(shorts = (state.shorts + rankedMore).distinctBy { it.id })
                     }
-                    FlowNeuroEngine.recordFeedImpressions(rankedMore)
                 }
                 
                 val newVideos = rawVideos.filterValid()
                     .filterWatched(watchedVideoIds.value)
                     .filterRecentHomeSuggestion(System.currentTimeMillis())
 
-                
+                val currentIds = _uiState.value.videos.map { it.id }.toHashSet()
+                val page = mutableListOf<Video>()
+                val channelCounts = HashMap<String, Int>()
+                val pageIds = HashSet<String>(currentIds)
+
                 if (newVideos.isNotEmpty()) {
                     val userSubs = subscriptionRepository.getAllSubscriptionIds()
-                    val rankedBatch = FlowNeuroEngine.rank(newVideos, userSubs)
-                                        .shuffled()
-                                        .distinctBy { it.channelId } 
-                    val currentIds = _uiState.value.videos.map { it.id }.toHashSet()
-                    val uniqueNew = rankedBatch.filter { !currentIds.contains(it.id) }
+                    val brain = FlowNeuroEngine.getBrainSnapshot()
+                    val taste = feedTasteProfile(brain, FlowNeuroEngine.getPersona(brain))
+                    demoteByFit(FlowNeuroEngine.rank(newVideos, userSubs), taste)
+                        .forEach { addUnique(it, page, channelCounts, pageIds, maxPerChannel = 2) }
+                }
 
+                if (page.size < MIN_PAGE_SIZE && subsBacklog.isNotEmpty()) {
+                    for (v in subsBacklog) {
+                        if (page.size >= MIN_PAGE_SIZE) break
+                        addUnique(v, page, channelCounts, pageIds, maxPerChannel = 2)
+                    }
+                    subsBacklog = subsBacklog.filterNot { pageIds.contains(it.id) }
+                }
+
+                if (page.isNotEmpty()) {
                     _uiState.update { state ->
+                        val tailChannels = state.videos.takeLast(2).map { it.channelId }
                         state.copy(
-                            videos = state.videos + uniqueNew,
+                            videos = state.videos + spaceByChannel(page, seedRecent = tailChannels),
                             isLoadingMore = false,
                             hasMorePages = true
                         )
                     }
-                    FlowNeuroEngine.recordFeedImpressions(uniqueNew)
                 } else {
                     _uiState.update { it.copy(isLoadingMore = false) }
                 }
@@ -575,7 +759,6 @@ class HomeViewModel @Inject constructor(
                     userSubs
                 )
                 updateVideosAndShorts(ranked, append = false)
-                FlowNeuroEngine.recordFeedImpressions(ranked)
 
                 _uiState.update { it.copy(
                     isLoading = false,
@@ -602,7 +785,6 @@ class HomeViewModel @Inject constructor(
             userSubs
         )
         updateVideosAndShorts(ranked, append = false)
-        FlowNeuroEngine.recordFeedImpressions(ranked)
         _uiState.update { it.copy(
             isLoading = false,
             hasMorePages = nextPage != null,
@@ -632,19 +814,114 @@ class HomeViewModel @Inject constructor(
     ): Boolean {
         if (video == null) return false
 
+        // Related-graph items carry no channelId; cap per-channel only when present.
+        val hasChannel = video.channelId.isNotBlank()
         val count = channelCounts[video.channelId] ?: 0
-        if (count >= maxPerChannel) return false
+        if (hasChannel && count >= maxPerChannel) return false
         if (!usedVideoIds.add(video.id)) return false
         targetList.add(video)
-        channelCounts[video.channelId] = count + 1
+        if (hasChannel) channelCounts[video.channelId] = count + 1
         return true
+    }
+
+    private suspend fun buildSeedInputs(): List<SeedInput> {
+        val history = viewHistory?.getVideoHistoryFlow()?.first() ?: return emptyList()
+        return seedInputsFrom(history)
+    }
+
+    /** Expands seed video ids into their related (/next) neighbours, cached and concurrency-bounded. */
+    private suspend fun fetchRelatedFor(seedIds: List<String>): List<Video> = coroutineScope {
+        if (seedIds.isEmpty()) return@coroutineScope emptyList()
+        seedIds.map { seedId ->
+            async {
+                val ts = System.currentTimeMillis()
+                relatedCache[seedId]?.takeIf { ts - it.ts < RELATED_TTL_MS }?.videos
+                    ?: (relatedSemaphore.withPermit {
+                        withTimeoutOrNull(4_000L) { repository.getRelatedCandidates(seedId) } ?: emptyList()
+                    }).also { relatedCache[seedId] = CachedRelated(it, ts) }
+            }
+        }.awaitAll().flatten()
+    }
+
+    private suspend fun gatherSavedSeedSources(): SavedSeedSources {
+        val historyIds = runCatching {
+            historyRepository.getVideoHistoryFlow().first()
+                .filter { !it.isShort }
+                .sortedByDescending { it.timestamp }
+                .map { it.videoId }
+        }.getOrElse { emptyList() }
+        val likedIds = runCatching {
+            likedVideosRepository.getLikedVideosFlow().first().map { it.videoId }
+        }.getOrElse { emptyList() }
+        val playlistIds = runCatching {
+            playlistRepository.getSavedVideoPlaylistVideoIds()
+        }.getOrElse { emptyList() }
+        return SavedSeedSources(historyIds, likedIds, playlistIds)
+    }
+
+    private fun activeSavedSeedCooldown(now: Long): Set<String> {
+        savedSeedCooldown.entries.removeAll { now - it.value > SAVED_SEED_COOLDOWN_MS }
+        return savedSeedCooldown.keys.toHashSet()
+    }
+
+    /**
+     * Enriches the feed with related neighbours of the videos the user saved/watched, on top of the
+     * lane quotas. Runs after first paint so it never delays load; chosen seeds enter a cooldown.
+     */
+    private fun enrichFeedWithSavedInterest(userSubs: Set<String>, taste: FeedTasteProfile) {
+        viewModelScope.launch(PerformanceDispatcher.networkIO) {
+            try {
+                val now = System.currentTimeMillis()
+                val seeds = selectSavedInterestSeeds(
+                    gatherSavedSeedSources(), activeSavedSeedCooldown(now),
+                    kotlin.random.Random.Default, maxSeeds = MAX_SAVED_SEEDS
+                )
+                if (seeds.isEmpty()) return@launch
+                seeds.forEach { savedSeedCooldown[it] = now }
+
+                val related = fetchRelatedFor(seeds)
+                if (related.isEmpty()) return@launch
+
+                val existing = _uiState.value.videos.mapTo(HashSet()) { it.id }
+                val enriched = demoteByFit(
+                    FlowNeuroEngine.rank(
+                        related.filterValid().filterWatched(watchedVideoIds.value)
+                            .filterRecentHomeSuggestion(now)
+                            .filterNot { existing.contains(it.id) },
+                        userSubs
+                    ),
+                    taste
+                ).take(SAVED_RELATED_SLOTS)
+                if (enriched.isEmpty()) return@launch
+
+                _uiState.update { state ->
+                    val tail = state.videos.takeLast(2).map { it.channelId }
+                    val merged = state.videos + spaceByChannel(enriched, seedRecent = tail)
+                    HomeFeedCache.update(merged, state.shorts)
+                    state.copy(videos = merged)
+                }
+                Log.d(TAG, "Saved-interest enrichment: +${enriched.size} from ${seeds.size} seeds")
+            } catch (e: Exception) {
+                Log.d(TAG, "Saved-interest enrichment failed: ${e.message}")
+            }
+        }
+    }
+
+    // Viewport impressions: count only items actually scrolled into view.
+    fun recordImpressions(visibleKeys: List<String>) {
+        if (visibleKeys.isEmpty()) return
+        val knownIds = _uiState.value.videos.mapTo(HashSet()) { it.id }
+        val ids = feedImpressionIds(visibleKeys, knownIds)
+        if (ids.isEmpty()) return
+        viewModelScope.launch { FlowNeuroEngine.recordFeedImpressions(ids) }
     }
 
     private fun dynamicFreshSubSlots(subCount: Int): Int {
         return when {
-            subCount >= 120 -> 3
-            subCount >= 40 -> 2
-            else -> 1
+            subCount >= 120 -> 5
+            subCount >= 40 -> 4
+            subCount >= 5 -> 3
+            else -> 2
         }
     }
 

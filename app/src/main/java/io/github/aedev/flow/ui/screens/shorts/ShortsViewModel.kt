@@ -11,6 +11,7 @@ import io.github.aedev.flow.data.model.ShortVideo
 import io.github.aedev.flow.data.model.toShortVideo
 import io.github.aedev.flow.data.model.toVideo
 import io.github.aedev.flow.data.repository.YouTubeRepository
+import io.github.aedev.flow.data.shorts.ShortWatchClassifier
 import io.github.aedev.flow.data.shorts.ShortsRepository
 import io.github.aedev.flow.innertube.YouTube
 import io.github.aedev.flow.innertube.models.YouTubeClient
@@ -406,17 +407,12 @@ class ShortsViewModel @Inject constructor(
     fun recordShortWatched(short: ShortVideo, positionMs: Long, durationMs: Long) {
         viewModelScope.launch(PerformanceDispatcher.diskIO) {
             val video = short.toVideo()
-            val safeDuration = when {
-                durationMs > 0L -> durationMs
-                video.duration > 0 -> video.duration * 1000L
-                else -> positionMs.coerceAtLeast(1_000L)
-            }
-            val watchedPosition = positionMs.coerceAtLeast((safeDuration * 0.9f).toLong())
+            val signal = ShortWatchClassifier.classify(positionMs, durationMs, video.duration)
 
             viewHistory.savePlaybackPosition(
                 videoId = video.id,
-                position = watchedPosition.coerceAtMost(safeDuration),
-                duration = safeDuration,
+                position = signal.position,
+                duration = signal.safeDuration,
                 title = video.title,
                 thumbnailUrl = video.thumbnailUrl,
                 channelName = video.channelName,
@@ -428,8 +424,8 @@ class ShortsViewModel @Inject constructor(
             runCatching {
                 FlowNeuroEngine.onVideoInteraction(
                     video.copy(isShort = true),
-                    InteractionType.WATCHED,
-                    percentWatched = (watchedPosition.toFloat() / safeDuration.toFloat()).coerceIn(0f, 1f)
+                    signal.interaction,
+                    percentWatched = signal.percent
                 )
                 FlowNeuroEngine.recordSeenShorts(listOf(video.id))
             }.onFailure { e ->

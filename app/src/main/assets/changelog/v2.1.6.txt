@@ -1,6 +1,6 @@
 FLOW CHANGE LOG
 VERSION: 2.1.6
-DATE: 2026-06-22
+DATE: 2026-06-25
 STATUS: PRE-RELEASE
 
 NEW FEATURES
@@ -10,6 +10,8 @@ NEW FEATURES
 - Add custom mark as watched threshold settings
 - Add bottom navbar scroll events toggle
 - Add queue/playlist autoplay toggle
+- Add shorts search tab
+- Add new video ambient mode
 
 IMPROVEMENTS
 - Improve media notification handling #577
@@ -41,3 +43,15 @@ FIXES AND STABILITY
 - Fix missing audio tracks
 - Fix "Failed to parse video data" errors 
 - Fix videos playing in the wrong (AI-dubbed) audio language on some networks by always preferring the original audio track
+- Fix missing Shorts metadata
+- Fix missing playlist videos metadata
+
+ENGINE
+- Improve measurements foundation, add evaluation harness and deterministic scorers
+- Imrove correctness and clean dead interest profile
+- Improve Signal integrity, ranking and impressions
+- Introduce related-graph for improved feed quality
+- Improve feed quotas to 40/25/25/10 instead of previous 50/40/10
+- Fix scalar relevance dilution
+- Improve persona handling, and remove novilty cliff and filter bubble
+- Improve engine performace and avoid over-supression
