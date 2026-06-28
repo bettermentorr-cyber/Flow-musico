@@ -3,7 +3,6 @@ package io.github.aedev.flow.ui.screens.player
 import android.os.SystemClock
 import androidx.compose.animation.*
 import androidx.compose.animation.core.*
-import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.interaction.MutableInteractionSource
@@ -24,15 +23,13 @@ import androidx.compose.ui.draw.scale
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.StrokeCap
-import androidx.compose.ui.graphics.drawscope.Stroke
-import androidx.compose.ui.graphics.drawscope.rotate
 import androidx.compose.ui.graphics.vector.ImageVector
-import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import io.github.aedev.flow.ui.screens.player.components.LockModeTouchShield
 import io.github.aedev.flow.ui.screens.player.components.SeekbarWithPreview
 import io.github.aedev.flow.ui.screens.player.util.VideoPlayerUtils
 import io.github.aedev.flow.player.EnhancedPlayerManager
@@ -54,6 +51,15 @@ import kotlin.math.abs
 
 private const val LIVE_SCRUB_SEEK_INTERVAL_MS = 80L
 private const val LIVE_SCRUB_IMMEDIATE_DELTA_MS = 750L
+private val OverlayActionButtonSize = 40.dp
+private val OverlayActionIconSize = 24.dp
+private val OverlayActionSpacing = 8.dp
+private val OverlayPillHeight = 32.dp
+private val OverlayControlRowMinHeight = 44.dp
+
+// How long the lock-mode unlock affordance stays on screen before it auto-hides
+// for a clean, unobstructed locked view. A single tap re-reveals it (see issue #619).
+private const val LOCKED_OVERLAY_AUTO_HIDE_MS = 3_000L
 
 @Composable
 fun PremiumControlsOverlay(
@@ -106,6 +112,7 @@ fun PremiumControlsOverlay(
     onToggleRemainingTime: () -> Unit = {},
     isTouchLocked: Boolean = false,
     lockModeEnabled: Boolean = false,
+    lockOverlayRevealSignal: Int = 0,
     onTouchLockToggle: () -> Unit = {},
     modifier: Modifier = Modifier
 ) {
@@ -123,6 +130,35 @@ fun PremiumControlsOverlay(
     var lastScrubSeekPosition by remember { mutableLongStateOf(Long.MIN_VALUE) }
     var pendingScrubSeekJob by remember { mutableStateOf<Job?>(null) }
     val displayedPosition = scrubPosition ?: currentPosition
+
+    // Lock-mode unlock affordance auto-hide (issue #619). While touch-locked, the
+    // unlock button hides itself after a short delay so the locked view is clean,
+    // then a single tap anywhere re-reveals it and restarts the timer.
+    var isLockOverlayVisible by remember { mutableStateOf(true) }
+    // Bumped on every reveal so that re-revealing while already visible still
+    // restarts the auto-hide timer (a no-op `isLockOverlayVisible = true` would not).
+    var lockOverlayRevealTick by remember { mutableIntStateOf(0) }
+
+    val revealLockOverlay: () -> Unit = {
+        isLockOverlayVisible = true
+        lockOverlayRevealTick++
+    }
+
+    // Reset the unlock affordance to visible whenever lock mode is (re-)entered.
+    LaunchedEffect(isTouchLocked, lockOverlayRevealSignal) {
+        if (isTouchLocked) {
+            revealLockOverlay()
+        }
+    }
+
+    // Auto-hide the unlock affordance after the delay while it is showing in lock mode.
+    // Keyed on the reveal tick so each tap restarts the full delay window.
+    LaunchedEffect(isTouchLocked, isLockOverlayVisible, lockOverlayRevealTick) {
+        if (isTouchLocked && isLockOverlayVisible) {
+            delay(LOCKED_OVERLAY_AUTO_HIDE_MS)
+            isLockOverlayVisible = false
+        }
+    }
 
     DisposableEffect(Unit) {
         onDispose {
@@ -163,7 +199,7 @@ fun PremiumControlsOverlay(
     )
     val fullscreenSeekbarBottomPadding = if (isFullscreen) 30.dp else 0.dp
     val topControlHorizontalPadding = if (isFullscreen) 56.dp else 20.dp
-    val topControlVerticalPadding = if (isFullscreen) 8.dp else 0.dp
+    val topControlVerticalPadding = if (isFullscreen) 8.dp else 4.dp
     val bottomControlHorizontalPadding = if (isFullscreen) 56.dp else 10.dp
     val bottomControlsSeekbarOverlap = 0.dp
     val seekbarHorizontalPadding = if (isFullscreen) fullscreenSeekbarHorizontalPaddingDp.dp else 0.dp
@@ -185,8 +221,10 @@ fun PremiumControlsOverlay(
     ) {
         AnimatedVisibility(
             visible = isVisible,
-            enter = fadeIn(animationSpec = tween(300)),
-            exit = fadeOut(animationSpec = tween(300)),
+            enter = fadeIn(animationSpec = tween(220, easing = FastOutSlowInEasing)) +
+                scaleIn(animationSpec = tween(220, easing = FastOutSlowInEasing), initialScale = 0.985f),
+            exit = fadeOut(animationSpec = tween(180, easing = FastOutSlowInEasing)) +
+                scaleOut(animationSpec = tween(180, easing = FastOutSlowInEasing), targetScale = 0.985f),
             modifier = Modifier.matchParentSize()
         ) {
             Box(
@@ -201,40 +239,39 @@ fun PremiumControlsOverlay(
                     )
             ) {
             if (isTouchLocked) {
-                Box(
-                    modifier = Modifier
-                        .matchParentSize()
-                        .pointerInput(Unit) {
-                            awaitPointerEventScope {
-                                while (true) {
-                                    val event = awaitPointerEvent()
-                                    event.changes.forEach { it.consume() }
-                                }
-                            }
-                        }
+                LockModeTouchShield(
+                    onRevealUnlock = revealLockOverlay,
+                    onUnlock = onTouchLockToggle,
+                    modifier = Modifier.matchParentSize()
                 )
 
-                Surface(
-                    color = Color.Black.copy(alpha = 0.42f),
-                    shape = CircleShape,
-                    modifier = Modifier
-                        .align(Alignment.TopEnd)
-                        .padding(horizontal = 16.dp, vertical = 12.dp)
-                        .size(44.dp)
-                        .clip(CircleShape)
-                        .clickable(
-                            interactionSource = remember { MutableInteractionSource() },
-                            indication = ripple(color = Color.White),
-                            onClick = onTouchLockToggle
-                        )
+                AnimatedVisibility(
+                    visible = isLockOverlayVisible,
+                    enter = fadeIn(animationSpec = tween(300)),
+                    exit = fadeOut(animationSpec = tween(300)),
+                    modifier = Modifier.align(Alignment.TopEnd)
                 ) {
-                    Box(contentAlignment = Alignment.Center) {
-                        Icon(
-                            imageVector = Icons.Rounded.LockOpen,
-                            contentDescription = stringResource(R.string.player_unlock_controls),
-                            tint = Color.White,
-                            modifier = Modifier.size(24.dp)
-                        )
+                    Surface(
+                        color = Color.Black.copy(alpha = 0.42f),
+                        shape = CircleShape,
+                        modifier = Modifier
+                            .padding(horizontal = 16.dp, vertical = 12.dp)
+                            .size(44.dp)
+                            .clip(CircleShape)
+                            .clickable(
+                                interactionSource = remember { MutableInteractionSource() },
+                                indication = ripple(color = Color.White),
+                                onClick = onTouchLockToggle
+                            )
+                    ) {
+                        Box(contentAlignment = Alignment.Center) {
+                            Icon(
+                                imageVector = Icons.Rounded.LockOpen,
+                                contentDescription = stringResource(R.string.player_unlock_controls),
+                                tint = Color.White,
+                                modifier = Modifier.size(24.dp)
+                            )
+                        }
                     }
                 }
             } else {
@@ -253,6 +290,7 @@ fun PremiumControlsOverlay(
                 Row(
                 modifier = Modifier
                     .fillMaxWidth()
+                    .heightIn(min = OverlayControlRowMinHeight)
                     .padding(horizontal = topControlHorizontalPadding, vertical = topControlVerticalPadding),
                 verticalAlignment = Alignment.CenterVertically,
                 horizontalArrangement = Arrangement.SpaceBetween
@@ -260,12 +298,12 @@ fun PremiumControlsOverlay(
                 Row(
                     modifier = Modifier.weight(1f),
                     verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    horizontalArrangement = Arrangement.spacedBy(OverlayActionSpacing)
                 ) {
                     // Down Arrow (Minimize/Back)
                     Box(
                         modifier = Modifier
-                            .size(48.dp)
+                            .size(OverlayActionButtonSize)
                             .clip(CircleShape)
                             .clickable(
                                 interactionSource = remember { MutableInteractionSource() },
@@ -278,7 +316,7 @@ fun PremiumControlsOverlay(
                             imageVector = Icons.Rounded.KeyboardArrowDown,
                             contentDescription = stringResource(R.string.btn_minimize),
                             tint = Color.White,
-                            modifier = Modifier.size(32.dp)
+                            modifier = Modifier.size(28.dp)
                         )
                     }
 
@@ -300,13 +338,13 @@ fun PremiumControlsOverlay(
                     if (isPipSupported && overlayPipEnabled) {
                         IconButton(
                             onClick = onPipClick,
-                            modifier = Modifier.size(40.dp)
+                            modifier = Modifier.size(OverlayActionButtonSize)
                         ) {
                             Icon(
                                 imageVector = Icons.Rounded.PictureInPicture,
                                 contentDescription = stringResource(R.string.pip_mode),
                                 tint = Color.White,
-                                modifier = Modifier.size(24.dp)
+                                modifier = Modifier.size(OverlayActionIconSize)
                             )
                         }
                     }
@@ -315,13 +353,13 @@ fun PremiumControlsOverlay(
                     if (sbSubmitEnabled) {
                         IconButton(
                             onClick = onSbSubmitClick,
-                            modifier = Modifier.size(40.dp)
+                            modifier = Modifier.size(OverlayActionButtonSize)
                         ) {
                             Icon(
                                 painter = painterResource(R.drawable.ic_upload_segment),
                                 contentDescription = stringResource(R.string.sb_submit_dialog_title),
                                 tint = Color.White,
-                                modifier = Modifier.size(24.dp)
+                                modifier = Modifier.size(OverlayActionIconSize)
                             )
                         }
                     }
@@ -330,14 +368,14 @@ fun PremiumControlsOverlay(
                 // Right Actions: Cast, CC, Autoplay, Settings
                 Row(
                     verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(4.dp)
+                    horizontalArrangement = Arrangement.spacedBy(OverlayActionSpacing)
                 ) {
                     if (overlaySpeedIndicatorEnabled) {
                         Surface(
                             color = Color.Black.copy(alpha = 0.4f),
                             shape = RoundedCornerShape(14.dp),
                             modifier = Modifier
-                                .height(32.dp)
+                                .height(OverlayPillHeight)
                                 .clip(RoundedCornerShape(14.dp))
                                 .clickable { onSpeedClick() }
                         ) {
@@ -360,7 +398,7 @@ fun PremiumControlsOverlay(
                     if (isFullscreen) {
                         IconButton(
                             onClick = onResizeClick,
-                            modifier = Modifier.size(40.dp)
+                            modifier = Modifier.size(OverlayActionButtonSize)
                         ) {
                             Icon(
                                 imageVector = when (resizeMode) {
@@ -370,7 +408,7 @@ fun PremiumControlsOverlay(
                                 },
                                 contentDescription = stringResource(R.string.resize_to, resizeModes[resizeMode]),
                                 tint = Color.White,
-                                modifier = Modifier.size(24.dp)
+                                modifier = Modifier.size(OverlayActionIconSize)
                             )
                         }
                     }
@@ -379,13 +417,13 @@ fun PremiumControlsOverlay(
                     if (overlayCastEnabled) {
                         IconButton(
                             onClick = onCastClick,
-                            modifier = Modifier.size(40.dp)
+                            modifier = Modifier.size(OverlayActionButtonSize)
                         ) {
                             Icon(
                                 imageVector = if (isCasting) Icons.Rounded.Cast else Icons.Outlined.Cast,
                                 contentDescription = stringResource(R.string.cast_to_tv),
                                 tint = if (isCasting) primaryColor else Color.White,
-                                modifier = Modifier.size(24.dp)
+                                modifier = Modifier.size(OverlayActionIconSize)
                             )
                         }
                     }
@@ -394,13 +432,13 @@ fun PremiumControlsOverlay(
                     if (overlayCcEnabled) {
                         IconButton(
                             onClick = onSubtitleClick,
-                            modifier = Modifier.size(40.dp)
+                            modifier = Modifier.size(OverlayActionButtonSize)
                         ) {
                             Icon(
                                 imageVector = if (isSubtitlesEnabled) Icons.Rounded.ClosedCaption else Icons.Outlined.ClosedCaption,
                                 contentDescription = stringResource(R.string.captions),
                                 tint = if (isSubtitlesEnabled) primaryColor else Color.White,
-                                modifier = Modifier.size(24.dp)
+                                modifier = Modifier.size(OverlayActionIconSize)
                             )
                         }
                     }
@@ -410,7 +448,7 @@ fun PremiumControlsOverlay(
                         IconButton(
                             onClick = { if (!isLooping) onAutoplayToggle(!autoplayEnabled) },
                             enabled = !isLooping,
-                            modifier = Modifier.size(40.dp)
+                            modifier = Modifier.size(OverlayActionButtonSize)
                         ) {
                             Icon(
                                 imageVector = Icons.Rounded.SlowMotionVideo,
@@ -420,7 +458,7 @@ fun PremiumControlsOverlay(
                                     autoplayEnabled -> primaryColor
                                     else -> Color.White.copy(alpha = 0.7f)
                                 },
-                                modifier = Modifier.size(24.dp)
+                                modifier = Modifier.size(OverlayActionIconSize)
                             )
                         }
                     }
@@ -429,13 +467,13 @@ fun PremiumControlsOverlay(
                     if (overlaySleepTimerEnabled) {
                         IconButton(
                             onClick = onSleepTimerClick,
-                            modifier = Modifier.size(40.dp)
+                            modifier = Modifier.size(OverlayActionButtonSize)
                         ) {
                             Icon(
                                 imageVector = Icons.Rounded.Bedtime,
                                 contentDescription = stringResource(R.string.sleep_timer),
                                 tint = if (isSleepTimerActive) primaryColor else Color.White,
-                                modifier = Modifier.size(24.dp)
+                                modifier = Modifier.size(OverlayActionIconSize)
                             )
                         }
                     }
@@ -443,13 +481,13 @@ fun PremiumControlsOverlay(
                     if (lockModeEnabled) {
                         IconButton(
                             onClick = onTouchLockToggle,
-                            modifier = Modifier.size(40.dp)
+                            modifier = Modifier.size(OverlayActionButtonSize)
                         ) {
                             Icon(
                                 imageVector = Icons.Rounded.Lock,
                                 contentDescription = stringResource(R.string.player_lock_controls),
                                 tint = Color.White,
-                                modifier = Modifier.size(24.dp)
+                                modifier = Modifier.size(OverlayActionIconSize)
                             )
                         }
                     }
@@ -457,26 +495,26 @@ fun PremiumControlsOverlay(
                     if (isLiveChatAvailable && isFullscreen) {
                         IconButton(
                             onClick = onLiveChatClick,
-                            modifier = Modifier.size(40.dp)
+                            modifier = Modifier.size(OverlayActionButtonSize)
                         ) {
                             Icon(
                                 imageVector = Icons.Outlined.ChatBubbleOutline,
                                 contentDescription = stringResource(R.string.live_chat),
                                 tint = Color.White,
-                                modifier = Modifier.size(24.dp)
+                                modifier = Modifier.size(OverlayActionIconSize)
                             )
                         }
                     }
 
                     IconButton(
                         onClick = onSettingsClick,
-                        modifier = Modifier.size(40.dp)
+                        modifier = Modifier.size(OverlayActionButtonSize)
                     ) {
                         Icon(
                             imageVector = Icons.Rounded.Settings,
                             contentDescription = stringResource(R.string.settings),
                             tint = Color.White,
-                            modifier = Modifier.size(24.dp)
+                            modifier = Modifier.size(OverlayActionIconSize)
                         )
                     }
                 }
@@ -582,6 +620,7 @@ fun PremiumControlsOverlay(
                 Row(
                     modifier = Modifier
                         .fillMaxWidth()
+                        .heightIn(min = OverlayControlRowMinHeight)
                         .zIndex(1f)
                         .offset(y = bottomControlsSeekbarOverlap)
                         .padding(
@@ -593,24 +632,66 @@ fun PremiumControlsOverlay(
                     horizontalArrangement = Arrangement.Start,
                     verticalAlignment = Alignment.CenterVertically
                 ) {
-                    // Time Pill
-                    Surface(
-                        color = Color.Black.copy(alpha = 0.4f),
-                        shape = RoundedCornerShape(12.dp),
-                        modifier = Modifier
-                            .clip(RoundedCornerShape(12.dp))
-                            .clickable { if (isLive) onLiveClick() else onToggleRemainingTime() }
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(OverlayActionSpacing),
+                        modifier = Modifier.weight(1f)
                     ) {
-                        Row(
+                        // Time Pill
+                        Surface(
+                            color = Color.Black.copy(alpha = 0.4f),
+                            shape = RoundedCornerShape(12.dp),
                             modifier = Modifier
-                                .wrapContentWidth()
-                                .padding(horizontal = 12.dp, vertical = 4.dp),
-                            horizontalArrangement = Arrangement.Start,
-                            verticalAlignment = Alignment.CenterVertically
+                                .height(OverlayPillHeight)
+                                .clip(RoundedCornerShape(12.dp))
+                                .clickable { if (isLive) onLiveClick() else onToggleRemainingTime() }
                         ) {
-                            if (isLive) {
+                            Row(
+                                modifier = Modifier
+                                    .wrapContentWidth()
+                                    .padding(horizontal = 12.dp),
+                                horizontalArrangement = Arrangement.Start,
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                if (isLive) {
+                                    Text(
+                                        text = VideoPlayerUtils.formatTime(displayedPosition, padMinutes = true),
+                                        style = MaterialTheme.typography.labelMedium,
+                                        color = Color.White,
+                                        fontWeight = FontWeight.Bold
+                                    )
+                                    Text(
+                                        text = " / ",
+                                        style = MaterialTheme.typography.labelMedium,
+                                        color = Color.White.copy(alpha = 0.5f),
+                                        modifier = Modifier.padding(horizontal = 2.dp)
+                                    )
+                                    val dotAlpha by rememberInfiniteTransition(label = "liveDot").animateFloat(
+                                        initialValue = 1f,
+                                        targetValue = 0.2f,
+                                        animationSpec = infiniteRepeatable(
+                                            animation = tween(800, easing = LinearEasing),
+                                            repeatMode = RepeatMode.Reverse
+                                        ),
+                                        label = "dotAlpha"
+                                    )
+                                    Box(
+                                        modifier = Modifier
+                                            .size(8.dp)
+                                            .clip(CircleShape)
+                                            .background(Color.Red.copy(alpha = dotAlpha))
+                                    )
+                                    Spacer(modifier = Modifier.width(6.dp))
+                                    Text(
+                                        text = stringResource(R.string.player_live_label),
+                                        style = MaterialTheme.typography.labelMedium,
+                                        color = Color.Red,
+                                        fontWeight = FontWeight.ExtraBold,
+                                        letterSpacing = 1.sp
+                                    )
+                                } else {
                                 Text(
-                                    text = VideoPlayerUtils.formatTime(displayedPosition, padMinutes = true),
+                                    text = if (showRemainingTime) "-${VideoPlayerUtils.formatTime((duration - displayedPosition).coerceAtLeast(0), padMinutes = true)}" else VideoPlayerUtils.formatTime(displayedPosition, padMinutes = true),
                                     style = MaterialTheme.typography.labelMedium,
                                     color = Color.White,
                                     fontWeight = FontWeight.Bold
@@ -621,131 +702,97 @@ fun PremiumControlsOverlay(
                                     color = Color.White.copy(alpha = 0.5f),
                                     modifier = Modifier.padding(horizontal = 2.dp)
                                 )
-                                val dotAlpha by rememberInfiniteTransition(label = "liveDot").animateFloat(
-                                    initialValue = 1f,
-                                    targetValue = 0.2f,
-                                    animationSpec = infiniteRepeatable(
-                                        animation = tween(800, easing = LinearEasing),
-                                        repeatMode = RepeatMode.Reverse
-                                    ),
-                                    label = "dotAlpha"
-                                )
-                                Box(
-                                    modifier = Modifier
-                                        .size(8.dp)
-                                        .clip(CircleShape)
-                                        .background(Color.Red.copy(alpha = dotAlpha))
-                                )
-                                Spacer(modifier = Modifier.width(6.dp))
+                                
+                                // Total Duration
                                 Text(
-                                    text = stringResource(R.string.player_live_label),
+                                    text = VideoPlayerUtils.formatTime(duration, padMinutes = true),
                                     style = MaterialTheme.typography.labelMedium,
-                                    color = Color.Red,
-                                    fontWeight = FontWeight.ExtraBold,
-                                    letterSpacing = 1.sp
+                                    color = Color.White.copy(alpha = 0.7f)
                                 )
-                            } else {
-                            Text(
-                                text = if (showRemainingTime) "-${VideoPlayerUtils.formatTime((duration - displayedPosition).coerceAtLeast(0), padMinutes = true)}" else VideoPlayerUtils.formatTime(displayedPosition, padMinutes = true),
-                                style = MaterialTheme.typography.labelMedium,
-                                color = Color.White,
-                                fontWeight = FontWeight.Bold
-                            )
-                            
-                            Text(
-                                text = " / ",
-                                style = MaterialTheme.typography.labelMedium,
-                                color = Color.White.copy(alpha = 0.5f),
-                                modifier = Modifier.padding(horizontal = 2.dp)
-                            )
-                            
-                            // Total Duration
-                            Text(
-                                text = VideoPlayerUtils.formatTime(duration, padMinutes = true),
-                                style = MaterialTheme.typography.labelMedium,
-                                color = Color.White.copy(alpha = 0.7f)
-                            )
+                                }
                             }
                         }
-                    }
 
-                    // Chapter Display Pill
-                    if (currentChapter != null) {
-                        Spacer(modifier = Modifier.width(6.dp))
-                        
-                        Surface(
-                            color = Color.Black.copy(alpha = 0.4f),
-                            shape = RoundedCornerShape(12.dp),
-                            modifier = Modifier
-                                .clip(RoundedCornerShape(12.dp))
-                                .clickable { onChapterClick() }
-                        ) {
-                            Row(
-                                verticalAlignment = Alignment.CenterVertically,
+                        // Chapter Display Pill
+                        if (currentChapter != null) {
+                            Surface(
+                                color = Color.Black.copy(alpha = 0.4f),
+                                shape = RoundedCornerShape(12.dp),
                                 modifier = Modifier
-                                    .padding(horizontal = 12.dp, vertical = 4.dp)
+                                    .height(OverlayPillHeight)
+                                    .clip(RoundedCornerShape(12.dp))
+                                    .clickable { onChapterClick() }
                             ) {
-                                Text(
-                                    text = currentChapter.title,
-                                    style = MaterialTheme.typography.labelSmall,
-                                    color = Color.White,
-                                    fontWeight = FontWeight.Medium,
-                                    maxLines = 1,
-                                    overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis,
-                                    modifier = Modifier.widthIn(max = chapterMaxWidth)
-                                )
-                                Spacer(modifier = Modifier.width(4.dp))
-                                Icon(
-                                    imageVector = Icons.Rounded.ChevronRight,
-                                    contentDescription = null,
-                                    tint = Color.White.copy(alpha = 0.6f),
-                                    modifier = Modifier.size(14.dp)
-                                )
+                                Row(
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    modifier = Modifier
+                                        .padding(horizontal = 12.dp)
+                                ) {
+                                    Text(
+                                        text = currentChapter.title,
+                                        style = MaterialTheme.typography.labelSmall,
+                                        color = Color.White,
+                                        fontWeight = FontWeight.Medium,
+                                        maxLines = 1,
+                                        overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis,
+                                        modifier = Modifier.widthIn(max = chapterMaxWidth)
+                                    )
+                                    Spacer(modifier = Modifier.width(4.dp))
+                                    Icon(
+                                        imageVector = Icons.Rounded.ChevronRight,
+                                        contentDescription = null,
+                                        tint = Color.White.copy(alpha = 0.6f),
+                                        modifier = Modifier.size(14.dp)
+                                    )
+                                }
                             }
                         }
                     }
 
-                    Spacer(modifier = Modifier.weight(1f))
-                    if (compactQualityLabel != null) {
-                        Surface(
-                            color = Color.Black.copy(alpha = 0.4f),
-                            shape = CircleShape,
-                            modifier = Modifier
-                                .height(32.dp)
-                                .widthIn(min = 32.dp)
-                                .clip(CircleShape)
-                                .clickable { onQualityClick() }
-                        ) {
-                            Box(
-                                contentAlignment = Alignment.Center,
-                                modifier = Modifier.padding(horizontal = 14.dp)
-                            ) {
-                                Text(
-                                    text = compactQualityLabel,
-                                    color = Color.White,
-                                    style = MaterialTheme.typography.labelLarge,
-                                    fontWeight = FontWeight.Bold,
-                                    maxLines = 1
-                                )
-                            }
-                        }
-                        Spacer(modifier = Modifier.width(8.dp))
-                    }
-
-                    Box(
-                        modifier = Modifier
-                            .size(32.dp)
-                            .clip(CircleShape)
-                            .background(Color.Black.copy(alpha = 0.4f))
-                            .clickable(onClick = onFullscreenClick),
-                        contentAlignment = Alignment.Center
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(OverlayActionSpacing)
                     ) {
-                        Icon(
-                            imageVector = if (isFullscreen) Icons.Rounded.CloseFullscreen else Icons.Rounded.OpenInFull,
-                            contentDescription = stringResource(R.string.fullscreen),
-                            tint = Color.White,
-                            modifier = Modifier.size(24.dp)
-                        )
+                        if (compactQualityLabel != null) {
+                            Surface(
+                                color = Color.Black.copy(alpha = 0.4f),
+                                shape = CircleShape,
+                                modifier = Modifier
+                                    .height(OverlayPillHeight)
+                                    .widthIn(min = OverlayPillHeight)
+                                    .clip(CircleShape)
+                                    .clickable { onQualityClick() }
+                            ) {
+                                Box(
+                                    contentAlignment = Alignment.Center,
+                                    modifier = Modifier.padding(horizontal = 14.dp)
+                                ) {
+                                    Text(
+                                        text = compactQualityLabel,
+                                        color = Color.White,
+                                        style = MaterialTheme.typography.labelLarge,
+                                        fontWeight = FontWeight.Bold,
+                                        maxLines = 1
+                                    )
+                                }
+                            }
+                        }
+
+                        Box(
+                            modifier = Modifier
+                                .size(OverlayActionButtonSize)
+                                .clip(CircleShape)
+                                .background(Color.Black.copy(alpha = 0.4f))
+                                .clickable(onClick = onFullscreenClick),
+                            contentAlignment = Alignment.Center
+                        ) {
+                            Icon(
+                                imageVector = if (isFullscreen) Icons.Rounded.CloseFullscreen else Icons.Rounded.OpenInFull,
+                                contentDescription = stringResource(R.string.fullscreen),
+                                tint = Color.White,
+                                modifier = Modifier.size(OverlayActionIconSize)
+                            )
+                        }
                     }
                 }
 
@@ -915,46 +962,13 @@ fun PremiumControlsOverlay(
 
 @Composable
 fun SleekLoadingAnimation(modifier: Modifier = Modifier) {
-    val infiniteTransition = rememberInfiniteTransition(label = "loading")
-    val rotation by infiniteTransition.animateFloat(
-        initialValue = 0f,
-        targetValue = 360f,
-        animationSpec = infiniteRepeatable(
-            animation = tween(1000, easing = LinearEasing),
-            repeatMode = RepeatMode.Restart
-        ),
-        label = "rotation"
+    CircularProgressIndicator(
+        modifier = modifier,
+        color = MaterialTheme.colorScheme.primary,
+        trackColor = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.18f),
+        strokeWidth = 4.dp,
+        strokeCap = StrokeCap.Round
     )
-
-    val primaryColor = MaterialTheme.colorScheme.primary
-
-    Canvas(modifier = modifier) {
-        val strokeWidth = 4.dp.toPx()
-        
-        // Draw background track
-        drawArc(
-            color = Color.White.copy(alpha = 0.2f),
-            startAngle = 0f,
-            sweepAngle = 360f,
-            useCenter = false,
-            style = Stroke(width = strokeWidth, cap = StrokeCap.Round)
-        )
-        
-        // Draw animated arc
-        rotate(rotation) {
-            drawArc(
-                brush = Brush.sweepGradient(
-                    0.0f to Color.Transparent,
-                    0.5f to primaryColor,
-                    1.0f to primaryColor
-                ),
-                startAngle = 0f,
-                sweepAngle = 280f,
-                useCenter = false,
-                style = Stroke(width = strokeWidth, cap = StrokeCap.Round)
-            )
-        }
-    }
 }
 
 private fun String.toCompactQualityLabel(): String {
